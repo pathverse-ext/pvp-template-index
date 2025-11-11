@@ -1,0 +1,127 @@
+name: Index Plugin Release
+
+on:
+  repository_dispatch:
+    types: [pvp-plugin-released]
+  workflow_dispatch:
+    inputs:
+      org:
+        description: 'Organization name'
+        required: false
+        type: string
+        default: 'pathverse-ext'
+      repository:
+        description: 'Repository name (e.g., owner/repo)'
+        required: true
+        type: string
+      tag_name:
+        description: 'Release tag name'
+        required: true
+        type: string
+
+jobs:
+  index-plugin:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout index repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+      
+      - name: Set variables from repository_dispatch or workflow_dispatch
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" == "repository_dispatch" ]; then
+            REPO="${{ github.event.client_payload.repository }}"
+            echo "tag_name=${{ github.event.client_payload.tag_name }}" >> $GITHUB_OUTPUT
+            echo "release_id=${{ github.event.client_payload.release_id }}" >> $GITHUB_OUTPUT
+          else
+            REPO="${{ inputs.repository }}"
+            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+          fi
+          
+          # Ensure full owner/repo format for both cases
+          if [[ "$REPO" != *"/"* ]]; then
+            REPO="${{ inputs.org || 'pathverse-ext' }}/$REPO"
+          fi
+          
+          echo "repository=$REPO" >> $GITHUB_OUTPUT
+      
+      - name: Extract plugin name (strip pvp- prefix)
+        id: plugin
+        run: |
+          REPO_NAME="${{ steps.vars.outputs.repository }}"
+          PLUGIN_NAME="${REPO_NAME##*/}"  # Get repo name from owner/repo
+          
+          # Strip pvp- prefix if it exists
+          if [[ $PLUGIN_NAME == pvp-* ]]; then
+            PLUGIN_NAME="${PLUGIN_NAME#pvp-}"
+          fi
+          
+          echo "name=$PLUGIN_NAME" >> $GITHUB_OUTPUT
+          echo "Plugin name: $PLUGIN_NAME"
+      
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.PATHVERSE_ACCESS_TOKEN }}
+        run: |
+          TEMP_DIR="temp_download"
+          chmod +x scripts/download-assets.sh
+          ./scripts/download-assets.sh \
+            "${{ steps.vars.outputs.repository }}" \
+            "${{ steps.vars.outputs.tag_name }}" \
+            "$TEMP_DIR"
+      
+      - name: Calculate plugin checksum
+        id: checksum
+        run: |
+          chmod +x scripts/calculate-checksum.sh
+          SHA256=$(./scripts/calculate-checksum.sh "temp_download/plugin.evc")
+          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+          echo "✓ Plugin SHA256: $SHA256"
+      
+      - name: Copy plugin to plugins directory
+        run: |
+          mkdir -p plugins
+          cp temp_download/plugin.evc "plugins/${{ steps.checksum.outputs.sha256 }}.evc"
+          echo "✓ Copied plugin to plugins/${{ steps.checksum.outputs.sha256 }}.evc"
+      
+      - name: Evict previous patch versions
+        run: |
+          chmod +x scripts/evict-previous-patch.sh
+          ./scripts/evict-previous-patch.sh \
+            "index.json" \
+            "${{ steps.plugin.outputs.name }}" \
+            "${{ steps.vars.outputs.tag_name }}"
+      
+      - name: Update index.json
+        run: |
+          chmod +x scripts/update-index.sh
+          ./scripts/update-index.sh \
+            "index.json" \
+            "temp_download/manifest.json" \
+            "${{ steps.checksum.outputs.sha256 }}"
+      
+      - name: Commit and push changes
+        run: |
+          chmod +x scripts/commit-changes.sh
+          ./scripts/commit-changes.sh \
+            "${{ steps.checksum.outputs.sha256 }}" \
+            "${{ steps.plugin.outputs.name }}" \
+            "${{ steps.vars.outputs.tag_name }}" \
+            "${{ steps.vars.outputs.repository }}"
+      
+      - name: Create index summary
+        if: success()
+        run: |
+          echo "## Plugin Indexed Successfully 🎉" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Plugin**: ${{ steps.plugin.outputs.name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ steps.vars.outputs.tag_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Source**: ${{ steps.vars.outputs.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **SHA256**: \`${{ steps.checksum.outputs.sha256 }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **File**: \`plugins/${{ steps.checksum.outputs.sha256 }}.evc\`" >> $GITHUB_STEP_SUMMARY
